@@ -1,3 +1,5 @@
+module PINNs
+
 using NeuralPDE, Flux, ModelingToolkit, GalacticOptim, Optim, DiffEqFlux
 using Quadrature, Cuba, CUDA, QuasiMonteCarlo
 import ModelingToolkit: Interval, infimum, supremum
@@ -7,6 +9,32 @@ using ChainRulesCore, Zygote
 using DaggerFlux, Dagger, DaggerWebDash
 using DataFrames
 
+using LinearAlgebra
+
+struct SumLayer
+    layers::Vector
+end
+#=
+Zygote.@adjoint function (sl::SumLayer)(x)
+    return sl(x), dy -> (nothing, dy)
+end
+=#
+(par::SumLayer)(x) = reduce((x,y)-> x .+ y, map(l -> l(x), par.layers))
+#(par::SumLayer)(x) = collect(DaggerFlux.daglayer(par, x))
+DaggerFlux.daglayer(par::SumLayer, args...) =
+    delayed((xs...) -> reduce((x,y) -> x .+ y, xs))([DaggerFlux.daglayer(f, args...) for f in par.layers]...)
+#=
+(par::SumLayer)(ip) = error("SumLayer ran as-is!")
+DaggerFlux.dagargs(par::SumLayer, ip...) =
+    [delayed(DaggerFlux.dagexec)(f, ip...) for f in par.layers]
+DaggerFlux.dagexec(par::SumLayer, args...) =
+    reduce((x,y) -> x .+ y, args)
+=#
+
+DiffEqFlux.initial_params(f::DaggerChain) = Flux.destructure(f)[1]
+
+function setup(;inner=10)
+#=
 ml = Dagger.MultiEventLog()
 ml[:core] = Dagger.Events.CoreMetrics()
 ml[:id] = Dagger.Events.IDMetrics()
@@ -16,7 +44,7 @@ ml[:bytes] = Dagger.Events.BytesAllocd()
 ml[:mem] = Dagger.Events.MemoryFree()
 ml[:esat] = Dagger.Events.EventSaturation()
 ml[:psat] = Dagger.Events.ProcessorSaturation()
-lw = Dagger.Events.LogWindow(5*10^9, :core)
+lw = Dagger.Events.LogWindow(20*10^9, :core)
 df = DataFrame([key=>[] for key in keys(ml.consumers)]...)
 ts = Dagger.Events.TableStorage(df)
 push!(lw.creation_handlers, ts)
@@ -31,8 +59,8 @@ push!(d3r, DaggerWebDash.LinePlot(:core, :mem, "Available Memory", "% Free"))
 ml.aggregators[:logwindow] = lw
 ml.aggregators[:d3r] = d3r
 Dagger.global_context().log_sink = ml
+=#
 
-using LinearAlgebra
 BLAS.set_num_threads(1)
 
 @parameters t x y
@@ -65,28 +93,10 @@ domains = [t ∈ Interval(t_min,t_max),
 
 # Neural network
 
-struct SumLayer{L<:Tuple}
-    layers::L
-end
-#(par::SumLayer)(x) = reduce((x,y)-> x .+ y, map(l -> l(x), par.layers))
-(par::SumLayer)(ip) =
-    Dagger.delayed(xs -> reduce((x,y) -> x .+ y, xs))([DaggerFlux.daglayer(f, ip) for f in par.layers])
-Zygote.@adjoint function (sl::SumLayer)(x)
-    return sl(x), dy -> (nothing, dy)
-end
-DaggerFlux.daglayer(par::SumLayer, ip) =
-    Dagger.delayed(xs -> reduce((x,y) -> x .+ y, xs))([DaggerFlux.daglayer(f, ip) for f in par.layers])
-
-inner = 1000
 chain = Chain(Dense(3,inner,Flux.σ),
-              #SumLayer((
-                Dense(inner,inner,Flux.σ),
-                Dense(inner,inner,Flux.σ),
-                Dense(inner,inner,Flux.σ),
-              #)),
+              SumLayer([Dense(inner,inner,Flux.σ) for i in 1:8]),
               Dense(inner,1))
 chain = DaggerChain(chain)
-DiffEqFlux.initial_params(f::DaggerChain) = Flux.destructure(f)[1]
 #= TODO: Use FastChain
 chain = FastChain(FastDense(3,inner,Flux.σ),
                   FastDense(inner,inner,Flux.σ),
@@ -106,11 +116,17 @@ discretization = PhysicsInformedNN(chain,
 
 @named pde_system = PDESystem(eq,bcs,domains,[t,x,y],[u(t, x, y)])
 prob = discretize(pde_system,discretization)
-symprob = symbolic_discretize(pde_system,discretization)
+#symprob = symbolic_discretize(pde_system,discretization)
+prob
+end
 
-cb = function (p,l)
+function cb(p,l)
     println("Current loss is: $l")
     return false
 end
 
-res = GalacticOptim.solve(prob, ADAM(0.01); cb=cb, maxiters=2500)
+function solve(prob)
+    GalacticOptim.solve(prob, ADAM(0.01); cb=cb, maxiters=50)
+end
+
+end
